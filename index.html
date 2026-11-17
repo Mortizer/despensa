@@ -67,12 +67,33 @@ li.out .name small{color:var(--out)}
 .del:hover{color:var(--out)}
 .empty{text-align:center;color:var(--muted);padding:32px 12px;border:2px dashed var(--line);border-radius:14px;margin-top:18px}
 @media (max-width:420px){form.add{grid-template-columns:1fr 1fr}.qty span{min-width:52px}}
+.bar{display:flex;gap:10px;align-items:center;justify-content:space-between;font-size:.9rem;color:var(--muted);margin:0 0 14px;flex-wrap:wrap}
+.bar button{background:none;border:0;color:var(--accent);font-weight:600;cursor:pointer;padding:4px 0;text-decoration:underline}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--accent);margin-right:6px}
+.dot.off{background:var(--low)}
+.setup{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px;display:grid;gap:12px}
+.setup p{margin:0;color:var(--muted)}
+.warn{background:var(--out-bg);color:var(--out);border:1px solid var(--out);border-radius:12px;padding:12px;margin-bottom:14px}
+[hidden]{display:none!important}
 </style>
 </head>
 <body>
 <main>
   <h1>Mi despensa</h1>
-  <p class="sub">Qué tienes en casa y cuánto queda.</p>
+  <p class="sub">Qué tienes en casa y cuánto queda, sincronizado entre todos tus dispositivos.</p>
+  <div id="warn" class="warn" hidden></div>
+  <form class="setup" id="setup" hidden>
+    <p>Escribe un <strong>código familiar</strong>. Todos los dispositivos que usen el mismo código verán la misma despensa. Usa letras, números o guiones, mínimo 6 caracteres, y que no sea fácil de adivinar.</p>
+    <label>Código familiar
+      <input id="code" required minlength="6" maxlength="40" autocomplete="off" autocapitalize="none" placeholder="por ejemplo: cocina-lopez-2026">
+    </label>
+    <button class="primary" type="submit">Entrar</button>
+  </form>
+  <div class="bar" id="bar" hidden>
+    <span><span class="dot" id="dot"></span><span id="st">Conectando…</span></span>
+    <button type="button" id="chg">Cambiar código</button>
+  </div>
+  <div id="app" hidden>
 
   <form class="add" id="f">
     <label class="full">Producto
@@ -100,82 +121,130 @@ li.out .name small{color:var(--out)}
   </div>
 
   <div id="list"></div>
+  </div>
 </main>
 
-<script>
-(function(){
-  var KEY="despensa-v1", items=[];
-  try{ var raw=localStorage.getItem(KEY); if(raw) items=JSON.parse(raw)||[]; }catch(e){ items=[]; }
-  function save(){ try{ localStorage.setItem(KEY,JSON.stringify(items)); }catch(e){} }
-  function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
-  function step(u){ return (u==="kg"||u==="l")?0.5:(u==="g"||u==="ml")?100:1; }
-  function fmt(n){ return String(Math.round(n*100)/100).replace(".",","); }
-  function esc(s){ return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];}); }
+<script type="module">
+import {initializeApp} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import {initializeFirestore,persistentLocalCache,collection,doc,setDoc,updateDoc,deleteDoc,onSnapshot} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-  var list=document.getElementById("list"), search=document.getElementById("s"), count=document.getElementById("count");
+// Your web app's Firebase configuration
+const firebaseConfig = {
+  apiKey: "AIzaSyC17jtm7MRTevvo9MyFaZdlO-_capME76o",
+  authDomain: "despensa-25e06.firebaseapp.com",
+  projectId: "despensa-25e06",
+  storageBucket: "despensa-25e06.firebasestorage.app",
+  messagingSenderId: "272411615472",
+  appId: "1:272411615472:web:73a4a263041ea2a78f2235"
+};
 
-  function render(){
-    var term=search.value.trim().toLowerCase();
-    var shown=items.filter(function(i){return i.name.toLowerCase().indexOf(term)>-1||(i.cat||"").toLowerCase().indexOf(term)>-1;});
-    count.textContent=items.length+(items.length===1?" producto":" productos");
+var CODE_KEY="despensa-codigo", items=[], col=null, unsub=null, db=null;
+var $=function(id){return document.getElementById(id);};
+function step(u){ return (u==="kg"||u==="l")?0.5:(u==="g"||u==="ml")?100:1; }
+function r2(n){ return Math.round(n*100)/100; }
+function fmt(n){ return String(r2(n)).replace(".",","); }
+function esc(s){ return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];}); }
+function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
+function getCode(){ try{return localStorage.getItem(CODE_KEY)||"";}catch(e){return "";} }
+function setCode(c){ try{localStorage.setItem(CODE_KEY,c);}catch(e){} }
+function clean(c){ return c.toLowerCase().replace(/[^a-z0-9_-]/g,""); }
+function status(txt,off){ $("st").textContent=txt; $("dot").className="dot"+(off?" off":""); }
 
-    var cats=[]; items.forEach(function(i){ if(i.cat&&cats.indexOf(i.cat)<0) cats.push(i.cat); });
-    document.getElementById("cats").innerHTML=cats.map(function(c){return '<option value="'+esc(c)+'">';}).join("");
+var configured = firebaseConfig.apiKey && firebaseConfig.apiKey!=="PEGA_AQUI";
+if(configured){
+  try{
+    var fb=initializeApp(firebaseConfig);
+    db=initializeFirestore(fb,{localCache:persistentLocalCache()});
+  }catch(e){ configured=false; console.error(e); }
+}
 
-    if(!items.length){ list.innerHTML='<div class="empty">Tu despensa está vacía. Añade el primer producto arriba.</div>'; return; }
-    if(!shown.length){ list.innerHTML='<div class="empty">No hay productos que coincidan con «'+esc(search.value)+'».</div>'; return; }
+function show(){
+  var code=getCode();
+  $("warn").hidden=configured;
+  if(!configured){ $("warn").textContent="Falta pegar la configuración de Firebase en el archivo index.html."; $("setup").hidden=true;$("bar").hidden=true;$("app").hidden=true; return; }
+  $("setup").hidden=!!code; $("bar").hidden=!code; $("app").hidden=!code;
+  if(code) connect(code);
+}
 
-    var groups={};
-    shown.forEach(function(i){ var g=i.cat||"Sin categoría"; (groups[g]=groups[g]||[]).push(i); });
-    var names=Object.keys(groups).sort(function(a,b){
-      if(a==="Sin categoría") return 1; if(b==="Sin categoría") return -1; return a.localeCompare(b,"es");
-    });
-    list.innerHTML=names.map(function(g){
-      var rows=groups[g].sort(function(a,b){return a.name.localeCompare(b.name,"es");}).map(function(i){
-        var state=i.q<=0?"out":(i.q<=step(i.u)&&i.u!=="g"&&i.u!=="ml"?"low":"");
-        var note=state==="out"?"Agotado":state==="low"?"Queda poco":"";
-        return '<li class="'+state+'" data-id="'+i.id+'">'+
-          '<div class="name">'+esc(i.name)+(note?'<small>'+note+'</small>':'')+'</div>'+
-          '<div class="qty">'+
-            '<button data-a="minus" aria-label="Quitar uno de '+esc(i.name)+'">−</button>'+
-            '<span>'+fmt(i.q)+' '+esc(i.u)+'</span>'+
-            '<button data-a="plus" aria-label="Añadir uno de '+esc(i.name)+'">+</button>'+
-          '</div>'+
-          '<button class="del" data-a="del" aria-label="Eliminar '+esc(i.name)+'">✕</button>'+
-        '</li>';
-      }).join("");
-      return '<h2>'+esc(g)+'</h2><ul>'+rows+'</ul>';
+function connect(code){
+  if(unsub){unsub();unsub=null;}
+  items=[]; render(); status("Conectando…",true);
+  col=collection(db,"pantries",code,"items");
+  unsub=onSnapshot(col,{includeMetadataChanges:true},function(snap){
+    items=snap.docs.map(function(d){var x=d.data();x.id=d.id;return x;});
+    status(snap.metadata.fromCache?"Sin conexión · se sincronizará al volver":"Sincronizado",snap.metadata.fromCache);
+    render();
+  },function(err){
+    console.error(err); status("Error de conexión: revisa las reglas de Firebase",true);
+  });
+}
+
+function render(){
+  var term=$("s").value.trim().toLowerCase();
+  var shown=items.filter(function(i){return (i.name||"").toLowerCase().indexOf(term)>-1||(i.cat||"").toLowerCase().indexOf(term)>-1;});
+  $("count").textContent=items.length+(items.length===1?" producto":" productos");
+  var cats=[]; items.forEach(function(i){ if(i.cat&&cats.indexOf(i.cat)<0) cats.push(i.cat); });
+  $("cats").innerHTML=cats.map(function(c){return '<option value="'+esc(c)+'">';}).join("");
+  var list=$("list");
+  if(!items.length){ list.innerHTML='<div class="empty">Tu despensa está vacía. Añade el primer producto arriba.</div>'; return; }
+  if(!shown.length){ list.innerHTML='<div class="empty">No hay productos que coincidan con «'+esc($("s").value)+'».</div>'; return; }
+  var groups={};
+  shown.forEach(function(i){ var g=i.cat||"Sin categoría"; (groups[g]=groups[g]||[]).push(i); });
+  var names=Object.keys(groups).sort(function(a,b){
+    if(a==="Sin categoría") return 1; if(b==="Sin categoría") return -1; return a.localeCompare(b,"es");
+  });
+  list.innerHTML=names.map(function(g){
+    var rows=groups[g].sort(function(a,b){return a.name.localeCompare(b.name,"es");}).map(function(i){
+      var state=i.q<=0?"out":(i.q<=step(i.u)&&i.u!=="g"&&i.u!=="ml"?"low":"");
+      var note=state==="out"?"Agotado":state==="low"?"Queda poco":"";
+      return '<li class="'+state+'" data-id="'+i.id+'">'+
+        '<div class="name">'+esc(i.name)+(note?'<small>'+note+'</small>':'')+'</div>'+
+        '<div class="qty">'+
+          '<button data-a="minus" aria-label="Quitar uno de '+esc(i.name)+'">−</button>'+
+          '<span>'+fmt(i.q)+' '+esc(i.u)+'</span>'+
+          '<button data-a="plus" aria-label="Añadir uno de '+esc(i.name)+'">+</button>'+
+        '</div>'+
+        '<button class="del" data-a="del" aria-label="Eliminar '+esc(i.name)+'">✕</button>'+
+      '</li>';
     }).join("");
-  }
+    return '<h2>'+esc(g)+'</h2><ul>'+rows+'</ul>';
+  }).join("");
+}
 
-  document.getElementById("f").addEventListener("submit",function(e){
-    e.preventDefault();
-    var name=document.getElementById("n").value.trim();
-    var cat=document.getElementById("c").value.trim();
-    var q=parseFloat(document.getElementById("q").value);
-    var u=document.getElementById("u").value;
-    if(!name||isNaN(q)||q<0) return;
-    var found=items.filter(function(i){return i.name.toLowerCase()===name.toLowerCase()&&i.u===u;})[0];
-    if(found){ found.q+=q; if(cat) found.cat=cat; }
-    else items.push({id:uid(),name:name,cat:cat,q:q,u:u});
-    save(); render();
-    document.getElementById("n").value=""; document.getElementById("q").value="1"; document.getElementById("n").focus();
-  });
+$("setup").addEventListener("submit",function(e){
+  e.preventDefault();
+  var c=clean($("code").value);
+  if(c.length<6){ alert("El código debe tener al menos 6 caracteres (letras, números o guiones)."); return; }
+  setCode(c); show();
+});
+$("chg").addEventListener("click",function(){
+  if(unsub){unsub();unsub=null;}
+  try{localStorage.removeItem(CODE_KEY);}catch(e){}
+  $("code").value=""; show();
+});
 
-  list.addEventListener("click",function(e){
-    var b=e.target.closest("button[data-a]"); if(!b) return;
-    var li=b.closest("li"), id=li.getAttribute("data-id");
-    var it=items.filter(function(i){return i.id===id;})[0]; if(!it) return;
-    var a=b.getAttribute("data-a");
-    if(a==="plus") it.q+=step(it.u);
-    else if(a==="minus") it.q=Math.max(0,it.q-step(it.u));
-    else if(a==="del"){ if(!confirm("¿Eliminar «"+it.name+"» de la despensa?")) return; items=items.filter(function(i){return i.id!==id;}); }
-    save(); render();
-  });
+$("f").addEventListener("submit",function(e){
+  e.preventDefault();
+  var name=$("n").value.trim(), cat=$("c").value.trim(), q=parseFloat($("q").value), u=$("u").value;
+  if(!name||isNaN(q)||q<0||!col) return;
+  var found=items.filter(function(i){return i.name.toLowerCase()===name.toLowerCase()&&i.u===u;})[0];
+  if(found){ var upd={q:r2(found.q+q)}; if(cat) upd.cat=cat; updateDoc(doc(col,found.id),upd); }
+  else setDoc(doc(col,uid()),{name:name,cat:cat,q:q,u:u});
+  $("n").value=""; $("q").value="1"; $("n").focus();
+});
 
-  search.addEventListener("input",render);
-  render();
-})();
+$("list").addEventListener("click",function(e){
+  var b=e.target.closest("button[data-a]"); if(!b||!col) return;
+  var id=b.closest("li").getAttribute("data-id");
+  var it=items.filter(function(i){return i.id===id;})[0]; if(!it) return;
+  var a=b.getAttribute("data-a"), ref=doc(col,id);
+  if(a==="plus") updateDoc(ref,{q:r2(it.q+step(it.u))});
+  else if(a==="minus") updateDoc(ref,{q:Math.max(0,r2(it.q-step(it.u)))});
+  else if(a==="del"){ if(confirm("¿Eliminar «"+it.name+"» de la despensa?")) deleteDoc(ref); }
+});
+
+$("s").addEventListener("input",render);
+show();
 </script>
 </body>
 </html>
